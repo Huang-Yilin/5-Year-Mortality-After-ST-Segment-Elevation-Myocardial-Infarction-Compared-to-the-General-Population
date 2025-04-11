@@ -1,0 +1,764 @@
+---
+title: "ana_open"
+author: "hyl"
+date: "2025-04-11"
+output: html_document
+---
+#0.1Formula and package preparation
+```{r setup, include=FALSE}
+install.packages("pacman")
+library(pacman)
+p_load(haven,mice,survey,dplyr,tibble,knitr,tidyverse,tidyfst,lattice,tableone,writexl,table1,readxl,survminer,foreign,car,sjmisc,nricens,openxlsx,Hmisc,ggtext,patchwork,ggplotify,cowplot,labelled,WeightIt,forestplot,gridExtra,cobalt,PSweight,lme4,geepack,MatchIt,flexsurv,boot,rstpm2,rms,data.table)
+
+# Export formatting adjustments
+export_to_excel <- function(data, file, sheet) {
+  if (file.exists(file)) {
+    wb <- loadWorkbook(file)
+    if (tolower(sheet) %in% tolower(names(wb))) {
+      removeWorksheet(wb, sheet)
+    }
+  } else {
+    wb <- createWorkbook()
+  }
+  addWorksheet(wb, sheet)
+  writeData(wb, sheet, as.data.frame(data), rowNames = TRUE) 
+  saveWorkbook(wb, file, overwrite = TRUE)
+}
+
+rate_diff_func <- function(data, indices) {
+  # Get bootstrap samples
+  sample_data <- data[indices, ]
+  # Recalculate the weighted mortality rate
+  weighted_case_mortality <-  weighted.mean(sample_data$death_lm[sample_data$case_control == 1], sample_data$weight[sample_data$case_control == 1])
+  weighted_control_mortality <- weighted.mean(sample_data$death_lm[sample_data$case_control == 0], sample_data$weight[sample_data$case_control == 0])
+  
+  rate_difference_bh <- weighted_case_mortality - weighted_control_mortality
+  return(rate_difference_bh)
+}
+calculate_weighted_mortality_rate_difference <- function(data) {
+  # Calculate the weighted mortality rate for the case group
+  weighted_case_mortality <- weighted.mean(data$death_lm[data$case_control == 1], data$weight[data$case_control == 1])
+  
+   # Calculate the weighted mortality rate for the control group
+  weighted_control_mortality <- weighted.mean(data$death_lm[data$case_control == 0], data$weight[data$case_control == 0])
+  # Calculate mortality differences
+  rate_difference <- weighted_case_mortality - weighted_control_mortality
+  
+  # Return a list of results
+  return(data.frame(weighted_case_mortality = weighted_case_mortality,
+                    weighted_control_mortality = weighted_control_mortality,
+                    rate_difference = rate_difference))
+}
+
+
+```
+#1.1 Matching using SAS code
+```{SAS Code}
+#For all STEMI patients
+proc psmatch data=merged_data;
+    class sex case_control;  /* Ensure full gender match */
+    psmodel case_control(treated='1') = age sex;  
+    /* Using the Mahalanobis distance, set the matching distance to age */
+    match method=greedy(k=5) exact=sex caliper=0.5 weight=ATTWGT;
+	assess lps var=(age sbp hyp)/varinfo weight=ATTWGT stddiff plots=none;
+    output out(obs=match)=drv2.matched_data1 matchid=matchid;
+run;
+
+#For STEMI patients treated with PPCI
+proc psmatch data=Mdata_ppci;
+    class sex case_control;  
+    psmodel case_control(treated='1')  = age sex;  
+    match method=greedy(k=5) exact=sex caliper=0.5 weight=ATTWGT;
+    output out(obs=match)=drv2.matched_data2 matchid=matchid;
+run;
+
+#For STEMI patients treated with fibrinolysis
+proc psmatch data=Mdata_fibri;
+    class sex case_control;  
+    psmodel case_control(treated='1')  = age sex;  
+    match method=greedy(k=5) exact=sex caliper=0.5 weight=ATTWGT;
+    output out(obs=match)=drv2.matched_data3 matchid=matchid;
+run;
+
+#For STEMI patients treated with conservative therapy
+proc psmatch data=Mdata_bs;
+    class sex case_control;  
+    psmodel case_control(treated='1')  = age sex;  
+    match method=greedy(k=5) exact=sex caliper=0.5 weight=ATTWGT  ;
+    output out(obs=match)=drv2.matched_data4 matchid=matchid;
+run;
+
+```
+#1.2.1 STEMI: split datasets by time
+```{r}
+#landmark1, in days 0-30
+LM1<-matched_data1 %>% mutate(FUds= case_when(
+      followupday <=30 ~ followupday ,
+      followupday  >30 ~ 30,
+      TRUE ~ NA),
+      FUds=if_else(FUds==0,0.0001,FUds),
+    death_lm = case_when(
+     followupday >30 & death == 1 ~ 0,
+      TRUE ~ death)
+    )%>% group_by(matchid) %>% 
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weighgt=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+
+#landmark2, within 30-90 days
+LM2 <- matched_data1 %>%
+  # Mark if case dies within 30 days
+  mutate(case_to_remove = ifelse(case_control == 1 & followupday <= 30 & death == 1, 1, 0)) %>%
+  # Flag each matchid for the presence of cases that died within 30 days
+  group_by(matchid) %>%
+  mutate(case_to_remove_matchid = max(case_to_remove, na.rm = TRUE)) %>%
+  ungroup() %>%
+  # Delete matchid with cases that died within 30 days
+  filter(case_to_remove_matchid == 0) %>%
+  # Marker whether control died within 30 days
+  mutate(control_to_remove = ifelse(case_control == 0 & followupday <= 30 & death == 1, 1, 0)) %>%
+  # For each matchid control, check if all controls die within 30 days
+  group_by(matchid) %>%
+  mutate(all_controls_dead_30days = max(control_to_remove, na.rm = TRUE)) %>%
+  # If all controls in a matchid are dead, mark the entire matchid as needing to be deleted.
+  mutate(remove_whole_matchid = ifelse(all_controls_dead_30days == 1, 1, 0)) %>%
+  ungroup() %>%
+  # Delete matchid where all controls died within 30 days (including cases)
+  filter(remove_whole_matchid == 0) %>%
+  # Create follow-up days and amended death markers
+  mutate(FUds = case_when(
+    followupday <= 90 ~ followupday,
+    followupday > 90 ~ 90,
+    TRUE ~ NA_real_  # Ensure NA type is correct
+  ),
+  death_lm = case_when(
+    followupday > 90 & death == 1 ~ 0,  # Time to death over 90 days set to 0
+    TRUE ~ death
+  ))%>% group_by(matchid) %>% # Calculate the number of each matchid
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+# 90days to 1 year
+LM3 <- matched_data1 %>%
+  # Create a new variable to mark if a case died within 90 days
+  mutate(case_to_remove = ifelse(case_control == 1 & followupday <= 90 & death == 1, 1, 0)) %>%
+  # Flag each matchid for the presence of cases that died within 90 days
+  group_by(matchid) %>%
+  mutate(case_to_remove_matchid = max(case_to_remove, na.rm = TRUE)) %>%
+  ungroup() %>%
+  # Delete matchid with cases that died within 90 days
+  filter(case_to_remove_matchid == 0) %>%
+  # Mark if all controls die within 90 days
+  mutate(control_to_remove = ifelse(case_control == 0 & followupday <= 90 & death == 1, 1, 0)) %>%
+  # For each matchid control, check if all controls died within 90 days
+  group_by(matchid) %>%
+  mutate(all_controls_dead_90days = max(control_to_remove, na.rm = TRUE)) %>%
+   # If all controls in a matchid are dead, mark the entire matchid as needing to be deleted.
+  mutate(remove_whole_matchid = ifelse(all_controls_dead_90days == 1, 1, 0)) %>%
+  ungroup() %>%
+  # Delete matchid where all controls died within 90 days (including cases)
+  filter(remove_whole_matchid == 0) %>% 
+  mutate(FUds=followupday,death_lm=death)%>% group_by(matchid) %>% # Calculate the number of each matchid
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+#0- 1year
+LM_3_1 <- matched_data1 %>% mutate(FUds= case_when(
+      followupday <=365 ~ followupday ,
+      followupday  >365 ~ 365,
+      TRUE ~ NA),
+      FUds=if_else(FUds==0,0.0001,FUds),
+    death_lm = case_when(
+     followupday >365 & death == 1 ~ 0,
+      TRUE ~ death)
+    )%>% group_by(matchid) %>% 
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+#1y-5y
+LM_3_2 <- matched_data1 %>%
+  mutate(case_to_remove = ifelse(case_control == 1 & followupday <= 365 & death == 1, 1, 0)) %>%
+  group_by(matchid) %>%
+  mutate(case_to_remove_matchid = max(case_to_remove, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(case_to_remove_matchid == 0) %>%
+  mutate(control_to_remove = ifelse(case_control == 0 & followupday <= 365 & death == 1, 1, 0)) %>%
+  group_by(matchid) %>%
+  mutate(all_controls_dead_90days = max(control_to_remove, na.rm = TRUE)) %>%
+  mutate(remove_whole_matchid = ifelse(all_controls_dead_90days == 1, 1, 0)) %>%
+  ungroup() %>%
+  filter(remove_whole_matchid == 0) %>% 
+  mutate(FUds=followupday,death_lm=death)%>% group_by(matchid) %>%
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+# 0-90 days
+LM4<-matched_data1 %>% mutate(FUds= case_when(
+      followupday <=90 ~ followupday ,
+      followupday  >90 ~ 90,
+      TRUE ~ NA),
+      FUds=if_else(FUds==0,0.0001,FUds),
+    death_lm = case_when(
+     followupday >90 & death == 1 ~ 0,
+      TRUE ~ death)
+    )%>% group_by(matchid) %>% 
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+
+cox_model_clustered1 <- coxph(Surv(FUds, death_lm) ~ case_control, data = LM1, weights = weight)
+cox_model_clustered2 <- coxph(Surv(FUds, death_lm) ~ case_control, data = LM2,  weights =weight)
+cox_model_clustered3 <- coxph(Surv(FUds, death_lm) ~ case_control, data = LM3, weights = weight)
+
+fit <- survfit(Surv(FUds, death_lm) ~ case_control, data = LM1, weights = weight)
+plot(fit, fun = "cloglog", xlab = "Time", ylab = "log(-log(Survival))")
+
+zph_model1 <-cox.zph(cox_model_clustered1)#LM1 does not meet the proportional risk assumption
+print(zph_model1)
+zph_model2 <-cox.zph(cox_model_clustered2)#LM2 meets the proportional risk assumption
+print(zph_model2)
+zph_model3 <-cox.zph(cox_model_clustered3)#LM3 does not meet the proportional risk assumption
+print(zph_model3)
+```
+
+#1.2.2 PPCI: split datasets by time
+```{r}
+#Code is almost same with 1.2.1
+#landmark1, in days 0-30
+LM_ppci1<-matched_data2 %>% mutate(FUds= case_when(
+      followupday <=30 ~ followupday ,
+      followupday  >30 ~ 30,
+      TRUE ~ NA),
+       FUds=if_else(FUds==0,0.0001,FUds),
+    death_lm = case_when(
+     followupday >30 & death == 1 ~ 0,
+      TRUE ~ death)
+    )%>% group_by(matchid) %>% 
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+
+#landmark2, within 30-90 days
+LM_ppci2 <- matched_data2 %>%
+  mutate(case_to_remove = ifelse(case_control == 1 & followupday <= 30 & death == 1, 1, 0)) %>%
+  group_by(matchid) %>%
+  mutate(case_to_remove_matchid = max(case_to_remove, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(case_to_remove_matchid == 0) %>%
+  mutate(control_to_remove = ifelse(case_control == 0 & followupday <= 30 & death == 1, 1, 0)) %>%
+  group_by(matchid) %>%
+  mutate(all_controls_dead_30days = max(control_to_remove, na.rm = TRUE)) %>%
+  mutate(remove_whole_matchid = ifelse(all_controls_dead_30days == 1, 1, 0)) %>%
+  ungroup() %>%
+  filter(remove_whole_matchid == 0) %>%
+  mutate(FUds = case_when(
+    followupday <= 90 ~ followupday,
+    followupday > 90 ~ 90,
+    TRUE ~ NA_real_ 
+  ),
+  death_lm = case_when(
+    followupday > 90 & death == 1 ~ 0, 
+    TRUE ~ death
+  ))%>% group_by(matchid) %>% 
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+#landmark3, 90 days to 1 year
+LM_ppci3 <- matched_data2 %>%
+  mutate(case_to_remove = ifelse(case_control == 1 & followupday <= 90 & death == 1, 1, 0)) %>%
+  group_by(matchid) %>%
+  mutate(case_to_remove_matchid = max(case_to_remove, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(case_to_remove_matchid == 0) %>%
+  mutate(control_to_remove = ifelse(case_control == 0 & followupday <= 90 & death == 1, 1, 0)) %>%
+  group_by(matchid) %>%
+  mutate(all_controls_dead_90days = max(control_to_remove, na.rm = TRUE)) %>%
+  mutate(remove_whole_matchid = ifelse(all_controls_dead_90days == 1, 1, 0)) %>%
+  ungroup() %>%
+  filter(remove_whole_matchid == 0) %>% 
+  mutate(FUds=followupday,death_lm=death)%>% group_by(matchid) %>% 
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+#0-1y
+LM_ppci3_1 <- matched_data2 %>% mutate(FUds= case_when(
+      followupday <=365 ~ followupday ,
+      followupday  >365 ~ 365,
+      TRUE ~ NA),
+      FUds=if_else(FUds==0,0.0001,FUds),
+    death_lm = case_when(
+     followupday >365 & death == 1 ~ 0,
+      TRUE ~ death)
+    )%>% group_by(matchid) %>% 
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+#1y-5y
+LM_ppci3_2 <- matched_data2 %>%
+  mutate(case_to_remove = ifelse(case_control == 1 & followupday <= 365 & death == 1, 1, 0)) %>%
+  group_by(matchid) %>%
+  mutate(case_to_remove_matchid = max(case_to_remove, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(case_to_remove_matchid == 0) %>%
+  mutate(control_to_remove = ifelse(case_control == 0 & followupday <= 365 & death == 1, 1, 0)) %>%
+  group_by(matchid) %>%
+  mutate(all_controls_dead_90days = max(control_to_remove, na.rm = TRUE)) %>%
+  mutate(remove_whole_matchid = ifelse(all_controls_dead_90days == 1, 1, 0)) %>%
+  ungroup() %>%
+  filter(remove_whole_matchid == 0) %>% 
+  mutate(FUds=followupday,death_lm=death)%>% group_by(matchid) %>% 
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+
+#landmark1,0-90 days
+LM_ppci4<-matched_data2 %>% mutate(FUds= case_when(
+      followupday <=90 ~ followupday ,
+      followupday  >90 ~ 90,
+      TRUE ~ NA),
+       FUds=if_else(FUds==0,0.0001,FUds),
+    death_lm = case_when(
+     followupday >90 & death == 1 ~ 0,
+      TRUE ~ death)
+    )%>% group_by(matchid) %>% 
+  mutate(matchid_size = n()) %>% 
+  ungroup() %>% mutate(weight=ifelse(case_control==0,1 /(matchid_size-1),1))
+
+```
+# 1.2.3 Fibrinolysis: split datasets by time (same logic as above, using matched_data3)
+
+#1.2.4 Conservative therapy: split datasets by time(same logic as above, using matched_data4)
+
+#2.1 Plot Figure1 cumulative survival curve
+```{r}
+
+custom_theme <- function() {
+  theme(
+    text = element_text(family = "serif", size = 12),  
+    panel.border = element_blank(),  
+    axis.line.x = element_line(size = 0.5),  
+    axis.line.y = element_line(size = 0.5),  
+    axis.line = element_line(size = 0.5),              
+    axis.ticks = element_line(size = 0.5),             
+    legend.position = "top",                          
+    legend.title = element_blank(),                   
+    panel.grid.major = element_blank(),                
+    panel.grid.minor = element_blank(),                
+    axis.text = element_text(size = 10),                
+    axis.title = element_text(size = 12)               
+  )
+}
+
+plot_survival_curve <- function(data, palette_colors, legend_labels) {
+
+  surv_fit <- survfit(Surv(followupday, death) ~ case_control, data = data, weights = weight)
+  
+
+  plot <- ggsurvplot(
+    surv_fit, data = data, conf.int = TRUE,
+    palette = palette_colors, 
+    xlab = "Follow-up days", ylab = "Death(%)",
+    ggtheme = theme_bw(), legend.labs = legend_labels,
+    fun = function(x) 100 * (1 - x)
+  )
+  
+
+  plot$plot <- plot$plot + custom_theme() +
+    scale_y_continuous(limits = c(0, 30)) +
+    scale_x_continuous(
+      breaks = c(0, 30, 90, 365, 365 * 2, 365 * 3, 365 * 4, 365 * 5),
+      labels = c(0, 30, 90, 365, 365 * 2, 365 * 3, 365 * 4, 365 * 5),
+      expand = c(0.05, 0)  
+    ) +
+    geom_vline(xintercept = 30, linetype = "dashed", color = "gray") +
+    geom_vline(xintercept = 90, linetype = "dashed", color = "gray") +
+    guides(color = guide_legend(nrow = 2)) +  
+    theme(
+      legend.position = "top",
+      legend.text = element_text(size = 10),
+      legend.key.height = unit(0.5, "cm"),  
+      legend.spacing.y = unit(0.2, "cm"),   
+      legend.margin = margin(t = 15, b = -40, unit = "pt") 
+    )
+  
+  return(plot)
+}
+
+
+p1 <- plot_survival_curve(
+  matched_data1,
+  palette_colors = c("#2E9FDF", "#CA6F62"),
+  legend_labels = c("STEMI Patients", "Age- and Sex-Matched General Population")
+)
+
+p2 <- plot_survival_curve(
+  matched_data2,
+  palette_colors = c("#2E9FDF", "#CA6F62"),
+  legend_labels = c("Patients treated with PPCI", "Age- and Sex-Matched General Population")
+)
+
+p3 <- plot_survival_curve(
+  matched_data3,
+  palette_colors = c("#2E9FDF", "#CA6F62"),
+  legend_labels = c("Patients treated with Fibrinolysis", "Age- and Sex-Matched General Population")
+)
+
+p4 <- plot_survival_curve(
+  matched_data4,
+  palette_colors = c("#2E9FDF", "#CA6F62"),
+  legend_labels = c("Patients treated without reperfusion", "Age- and Sex-Matched General Population")
+)
+
+p<-grid.arrange(p1$plot,p4$plot, p3$plot, p2$plot,ncol = 2)
+ggsave("Figure1.pdf",plot=p,width=40,height=15, units = "cm")
+
+```
+#2.2 calculated weighted mortality and rate difference
+```{r}
+library(parallel)
+library(boot)
+
+# Define function to calculate rate difference
+rate_diff_func <- function(data, indices) {
+  # Sample data based on indices
+  sample_data <- data[indices, ]
+  
+  # Calculate rate difference between cases and controls
+  rate_difference_bh <- weighted.mean(
+    sample_data$death_lm[sample_data$case_control == 1], 
+    sample_data$weight[sample_data$case_control == 1]
+  ) - weighted.mean(
+    sample_data$death_lm[sample_data$case_control == 0], 
+    sample_data$weight[sample_data$case_control == 0]
+  )
+  
+  return(rate_difference_bh)
+}
+
+# Calculate weighted mortality rates
+calculate_weighted_mortality <- function(data) {
+  # Calculate weighted mortality for case and control groups
+  weighted_case_mortality <- weighted.mean(
+    data$death_lm[data$case_control == 1], 
+    data$weight[data$case_control == 1]
+  )
+  weighted_control_mortality <- weighted.mean(
+    data$death_lm[data$case_control == 0], 
+    data$weight[data$case_control == 0]
+  )
+  
+  return(data.frame(
+    weighted_case_mortality = weighted_case_mortality,
+    weighted_control_mortality = weighted_control_mortality
+  ))
+}
+
+# List of datasets
+datasets <- list(
+ LM1 = LM1, LM2 = LM2, LM3 = LM3, 
+ LM_ppci1 = LM_ppci1, LM_ppci2 = LM_ppci2, LM_ppci3 = LM_ppci3, 
+  LM_f1 = LM_f1, LM_f2 = LM_f2, LM_f3 = LM_f3, 
+  LM_b1 = LM_b1, LM_b2 = LM_b2, LM_b3 = LM_b3
+)
+
+# Calculate weighted mortality rates and confidence intervals
+results <- lapply(names(datasets), function(name) {
+  data <- datasets[[name]]
+  
+  # Precompute mortality rates
+  mortality <- calculate_weighted_mortality(data)
+  mortality$dataset <- name
+  
+  # Perform bootstrap with default core settings
+  bootstrap <- boot(
+    data = data, 
+    statistic = rate_diff_func, 
+    R = 1000, # Adjust R for speed vs. accuracy
+    parallel = "multicore"
+  )
+  
+  # Calculate confidence intervals and handle cases where intervals cannot be computed
+  ci_diff <- tryCatch({
+    boot.ci(bootstrap, type = "perc")
+  }, error = function(e) NULL)
+  
+  # Add rate difference and confidence intervals or NA if intervals cannot be calculated
+  mortality$rate_difference <- mean(bootstrap$t)
+  mortality$ci_diff_lower <- if (!is.null(ci_diff)) ci_diff$perc[4] else NA
+  mortality$ci_diff_upper <- if (!is.null(ci_diff)) ci_diff$perc[5] else NA
+  
+  return(mortality)
+})
+
+# Combine results into a single dataset
+final_results <- do.call(rbind, results)
+final_results
+
+
+export_to_excel(final_results, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/Table2.xlsx", "weight")
+
+
+create_table_one <- function(data,datasets_name){
+  tableOne <- CreateTableOne(vars ="death_lm", factorVars ="death_lm",strata = c("case_control"),data =data, includeNA = F,addOverall=T)
+tab <- as.data.frame(print(tableOne,showAllLevels = F, quote = FALSE, noSpaces = TRUE, missing = TRUE,contDigits = 1))
+tab$dataset<-datasets_name
+return(tab)
+}
+all_table<-lapply(names(datasets),function(name){create_table_one(datasets[[name]],name)})
+final_table<-do.call(rbind,all_table)
+
+
+export_to_excel(final_table, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/TableS5.xlsx", "Sheet2")
+```
+#2.3Flexible parametric modeling
+```{r}
+library(rstpm2)
+extract_hr_p <- function(model, model_name) {
+  model_summary <- summary(model)
+
+  coef_value <- coef(model_summary)["case_control", "Estimate"]
+  se_value <- coef(model_summary)["case_control", "Std. Error"]
+  p_value <- coef(model_summary)["case_control", "Pr(z)"]
+
+  HR <- exp(coef_value)
+  HR_lower <- exp(coef_value - 1.96 * se_value)
+  HR_upper <- exp(coef_value + 1.96 * se_value)
+
+  result <- data.frame(
+    model_name = model_name,
+    HR = HR,
+    HR_lower = HR_lower,
+    HR_upper = HR_upper,
+    p = p_value
+  )
+  return(result)
+}
+
+#df was chosen according to the AIC guidelines.
+#ppci
+# 0-30 days
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =3, data = LM_ppci1)
+AIC(model_0_30)
+summary(model_0_30)
+
+# 30-90 days
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =3, data = LM_ppci2)
+summary(model_30_90)
+
+# 90-1year
+model_90_1y <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =3,  data = LM_ppci3_1)
+summary(model_90_1y)
+# 1 year-5 years
+model_1y_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =3, data = LM_ppci3_2)
+
+summary(model_1y_5y)
+
+# 90days -5 years
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =5, 
+                     data = LM_ppci3)
+AIC(model_90_5y)
+summary(model_90_5y)
+
+result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
+
+results_df <- rbind(result_0_30,result_30_90, result_90_5y)
+
+print(results_df)
+export_to_excel(results_df, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/Table2.xlsx", "ppci")
+
+#Firbrinolysis
+# As this dataset was fully matched using a 1:5 ratio, clustering by matchid_size is unnecessary.
+# 0-30 days
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control, df =3,data = LM_f1)
+AIC(model_0_30)
+summary(model_0_30)
+# 30-90 days
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control, df =5, data = LM_f2)
+AIC(model_30_90)
+summary(model_30_90)
+# 90days-5years
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control, df =5,data = LM_f3)
+AIC(model_90_5y)
+summary(model_90_5y)
+
+result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
+
+# 合并两个结果为一个数据框
+results_df1 <- rbind(result_0_30,result_30_90, result_90_5y)
+
+# 查看合并后的数据框
+print(results_df1)
+export_to_excel(results_df1, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/Table2.xlsx", "fibri")
+
+#Conservative therapy
+# 0-30days
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =3,data = LM_b1)
+AIC(model_0_30)
+summary(model_0_30)
+# 30-90days
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =5, data = LM_b2)
+AIC(model_30_90)
+summary(model_30_90)
+# 90days-5years
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =4,data = LM_b3)
+AIC(model_90_5y)
+summary(model_90_5y)
+
+result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
+
+
+results_df2 <- rbind(result_0_30,result_30_90, result_90_5y)
+
+
+print(results_df2)
+export_to_excel(results_df2, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/Table2.xlsx", "baoshou")
+
+#STEMI patients
+#0-30 days
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =4,data = LM1)
+AIC(model_0_30)
+summary(model_0_30 )
+#30-90days
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =5, data = LM2)
+AIC(model_30_90 )
+#90days-5 years
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =5,data = LM3)
+AIC(model_90_5y)
+summary(model_90_5y)
+result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
+
+
+results_df <- rbind(result_0_30,result_30_90, result_90_5y)
+
+
+print(results_df)
+export_to_excel(results_df, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/Table2.xlsx", "all")
+```
+#2.4 TableS7 Adding age and corvarites into models
+```{r}
+covariates <- c("diabetes", "hyp", "edu", "smoke")
+#ppci
+#only adjust age
+# 0-30 days
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =3,data = LM_ppci1)
+# 30-90 days
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =3, data = LM_ppci2)
+# 90 days-5 years
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =5, data = LM_ppci3)
+# Extract results for each model
+result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
+
+# Adjusted models with covariates
+# 0-30 days
+model_0_30 <- LM_ppci1 %>%
+  filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>% stpm2(Surv(FUds, death_lm) ~case_control+age+diabetes+hyp+edu+smoke+cluster(matchid_size), df =3, data = .)
+# 30-90 days
+model_30_90 <- LM_ppci2%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =3, data =. )
+# 90 days-5 years
+model_90_5y <- LM_ppci3%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =5, data = .)
+# Extract adjusted results
+result_0_30a <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90a <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5ya <- extract_hr_p(model_90_5y, "model_90_5y")
+# Combine results
+results_df <- rbind(result_0_30,result_30_90, result_90_5y,result_0_30a,result_30_90a, result_90_5ya)
+
+export_to_excel(results_df, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/TableS7.xlsx", "ppci")
+
+#Thrombolysis therapy
+#only adjust age
+# 0-30 days
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+age, df =3,data = LM_f1)
+# 30-90 days
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+age, df =5, data = LM_f2)
+# 90 days-5 years
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+age, df =5,data = LM_f3)
+# Extract results
+result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
+
+# Adjusted models with covariates
+# 0-30 days
+model_0_30 <- LM_f1%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke, df =3,data =. )
+# 30-90 days
+model_30_90 <- LM_f2%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke, df =3, data = .)
+# 90 days-5 years
+model_90_5y <- LM_f3%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke, df =5,data = .)
+
+result_0_30a <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90a <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5ya <- extract_hr_p(model_90_5y, "model_90_5y")
+
+results_df1 <- rbind(result_0_30,result_30_90, result_90_5y,result_0_30a,result_30_90a, result_90_5ya)
+export_to_excel(results_df1, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/TableS7.xlsx", "fibri")
+
+# Conservative therapy
+#only adjust age
+# 0-30 days
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =3,data = LM_b1)
+# 30-90 days
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =5, data = LM_b2)
+# 90 days-5 years
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =4,data = LM_b3)
+
+result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
+
+# Adjusted models with covariates
+# 0-30 days
+model_0_30 <- LM_b1%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =3,data =.)
+
+# 30-90 days
+model_30_90 <- LM_b2%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =5, data =.)
+# 90 days-5 years
+model_90_5y <- LM_b3%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =4,data =.)
+
+result_0_30a <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90a <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5ya <- extract_hr_p(model_90_5y, "model_90_5y")
+
+results_df2 <- rbind(result_0_30,result_30_90, result_90_5y,result_0_30a,result_30_90a, result_90_5ya)
+
+export_to_excel(results_df2, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/TableS7.xlsx", "baoshou")
+
+#All STEMI patients
+#only adjust age
+# 0-30 days
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =4, data = LM1)
+# 30-90 days
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =5, data = LM2)
+# 90 days-5 years
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =5, data = LM3)
+
+result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
+
+# Adjusted models with covariates
+# 0-30 days
+model_0_30 <- LM1%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =4, data =.)
+# 30-90 days
+model_30_90 <- LM2%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =5, data =.)
+# 90 days-5 years
+model_90_5y <- LM3%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =5, data =.)
+
+result_0_30a <- extract_hr_p(model_0_30, "model_0_30")
+result_30_90a <- extract_hr_p(model_30_90, "model_30_90")
+result_90_5ya <- extract_hr_p(model_90_5y, "model_90_5y")
+
+results_df <- rbind(result_0_30,result_30_90, result_90_5y,result_0_30a,result_30_90a, result_90_5ya)
+
+export_to_excel(results_df, "/Users/yilin/Documents/文章/心肌梗死病例对照/数据分析/结果/表/TableS7.xlsx", "all")
+```
