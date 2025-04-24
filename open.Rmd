@@ -59,7 +59,7 @@ proc psmatch data=merged_data;
     class sex case_control;  /* Ensure full gender match */
     psmodel case_control(treated='1') = age sex;  
     /* Using the Mahalanobis distance, set the matching distance to age */
-    match method=greedy(k=5) exact=sex caliper=0.5 weight=ATTWGT;
+    match method=greedy(k=5) exact=sex caliper=0.2 weight=ATTWGT;
 	assess lps var=(age sbp hyp)/varinfo weight=ATTWGT stddiff plots=none;
     output out(obs=match)=drv2.matched_data1 matchid=matchid;
 run;
@@ -68,7 +68,7 @@ run;
 proc psmatch data=Mdata_ppci;
     class sex case_control;  
     psmodel case_control(treated='1')  = age sex;  
-    match method=greedy(k=5) exact=sex caliper=0.5 weight=ATTWGT;
+    match method=greedy(k=5) exact=sex caliper=0.2 weight=ATTWGT;
     output out(obs=match)=drv2.matched_data2 matchid=matchid;
 run;
 
@@ -76,7 +76,7 @@ run;
 proc psmatch data=Mdata_fibri;
     class sex case_control;  
     psmodel case_control(treated='1')  = age sex;  
-    match method=greedy(k=5) exact=sex caliper=0.5 weight=ATTWGT;
+    match method=greedy(k=5) exact=sex caliper=0.2 weight=ATTWGT;
     output out(obs=match)=drv2.matched_data3 matchid=matchid;
 run;
 
@@ -84,7 +84,7 @@ run;
 proc psmatch data=Mdata_bs;
     class sex case_control;  
     psmodel case_control(treated='1')  = age sex;  
-    match method=greedy(k=5) exact=sex caliper=0.5 weight=ATTWGT  ;
+    match method=greedy(k=5) exact=sex caliper=0.2 weight=ATTWGT  ;
     output out(obs=match)=drv2.matched_data4 matchid=matchid;
 run;
 
@@ -542,7 +542,8 @@ AIC(model_0_30)
 summary(model_0_30)
 
 # 30-90 days
-model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =3, data = LM_ppci2)
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =5, 
+                     data = LM_ppci2)
 summary(model_30_90)
 
 # 90-1year
@@ -579,7 +580,7 @@ model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control, df =5, data = LM_f2)
 AIC(model_30_90)
 summary(model_30_90)
 # 90days-5years
-model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control, df =5,data = LM_f3)
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control, df =4,data = LM_f3)
 AIC(model_90_5y)
 summary(model_90_5y)
 
@@ -596,7 +597,7 @@ export_to_excel(results_df1, "/Users/yilin/Documents/文章/心肌梗死病例�
 
 #Conservative therapy
 # 0-30days
-model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =3,data = LM_b1)
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+ cluster(matchid_size), df =4,data = LM_b1)
 AIC(model_0_30)
 summary(model_0_30)
 # 30-90days
@@ -644,15 +645,15 @@ export_to_excel(results_df, "/Users/yilin/Documents/文章/心肌梗死病例对
 ```
 #2.4 TableS7 Adding age and corvarites into models
 ```{r}
-covariates <- c("diabetes", "hyp", "edu", "smoke")
+covariates <- c("diabetes", "hyp",  "smoke")
 #ppci
 #only adjust age
 # 0-30 days
 model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =3,data = LM_ppci1)
 # 30-90 days
-model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =3, data = LM_ppci2)
+model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =5, data = LM_ppci2)
 # 90 days-5 years
-model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =5, data = LM_ppci3)
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =3, data = LM_ppci3)
 # Extract results for each model
 result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
 result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
@@ -661,11 +662,11 @@ result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
 # Adjusted models with covariates
 # 0-30 days
 model_0_30 <- LM_ppci1 %>%
-  filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>% stpm2(Surv(FUds, death_lm) ~case_control+age+diabetes+hyp+edu+smoke+cluster(matchid_size), df =3, data = .)
+  filter(!(diabetes=="")&!(hyp=="")&!(smoke=="")) %>% stpm2(Surv(FUds, death_lm) ~case_control+age+diabetes+hyp+edu+smoke+cluster(matchid_size), df =3, data = .)
 # 30-90 days
-model_30_90 <- LM_ppci2%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =3, data =. )
+model_30_90 <- LM_ppci2%>% filter(!(diabetes=="")&!(hyp=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =5, data =. )
 # 90 days-5 years
-model_90_5y <- LM_ppci3%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =5, data = .)
+model_90_5y <- LM_ppci3%>% filter(!(diabetes=="")&!(hyp=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =5, data = .)
 # Extract adjusted results
 result_0_30a <- extract_hr_p(model_0_30, "model_0_30")
 result_30_90a <- extract_hr_p(model_30_90, "model_30_90")
@@ -682,7 +683,7 @@ model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+age, df =3,data = LM_f1)
 # 30-90 days
 model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+age, df =5, data = LM_f2)
 # 90 days-5 years
-model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+age, df =5,data = LM_f3)
+model_90_5y <- stpm2(Surv(FUds, death_lm) ~ case_control+age, df =4,data = LM_f3)
 # Extract results
 result_0_30 <- extract_hr_p(model_0_30, "model_0_30")
 result_30_90 <- extract_hr_p(model_30_90, "model_30_90")
@@ -692,9 +693,9 @@ result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
 # 0-30 days
 model_0_30 <- LM_f1%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke, df =3,data =. )
 # 30-90 days
-model_30_90 <- LM_f2%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke, df =3, data = .)
+model_30_90 <- LM_f2%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke, df =5, data = .)
 # 90 days-5 years
-model_90_5y <- LM_f3%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke, df =5,data = .)
+model_90_5y <- LM_f3%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke, df =4,data = .)
 
 result_0_30a <- extract_hr_p(model_0_30, "model_0_30")
 result_30_90a <- extract_hr_p(model_30_90, "model_30_90")
@@ -706,7 +707,7 @@ export_to_excel(results_df1, "/Users/yilin/Documents/文章/心肌梗死病例�
 # Conservative therapy
 #only adjust age
 # 0-30 days
-model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =3,data = LM_b1)
+model_0_30 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =4,data = LM_b1)
 # 30-90 days
 model_30_90 <- stpm2(Surv(FUds, death_lm) ~ case_control+age+ cluster(matchid_size), df =5, data = LM_b2)
 # 90 days-5 years
@@ -718,7 +719,7 @@ result_90_5y <- extract_hr_p(model_90_5y, "model_90_5y")
 
 # Adjusted models with covariates
 # 0-30 days
-model_0_30 <- LM_b1%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =3,data =.)
+model_0_30 <- LM_b1%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =4,data =.)
 
 # 30-90 days
 model_30_90 <- LM_b2%>% filter(!(diabetes=="")&!(hyp=="")&!(edu=="")&!(smoke=="")) %>%stpm2(Surv(FUds, death_lm) ~ case_control+age+diabetes+hyp+edu+smoke+ cluster(matchid_size), df =5, data =.)
